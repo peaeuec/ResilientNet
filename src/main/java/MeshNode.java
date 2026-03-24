@@ -19,9 +19,10 @@ public class MeshNode {
     private String role;
 
     // ===== Mesh State =====
-    private Map<InetSocketAddress, Long> neighbors = new ConcurrentHashMap<>();
+    private Map<InetSocketAddress, Long> neighbors    = new ConcurrentHashMap<>();
     private Map<String, InetSocketAddress> knownNodes = new ConcurrentHashMap<>();
     private Set<String> disconnectedNodes = Collections.newSetFromMap(new ConcurrentHashMap<>());
+    private Map<String, String> nodePriorities = new ConcurrentHashMap<>(); // nodeId -> priority label
 
     private Map<String, Message> localStore = new ConcurrentHashMap<>();
     private List<Message> buffer = Collections.synchronizedList(new ArrayList<>());
@@ -29,10 +30,10 @@ public class MeshNode {
     private ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2);
 
     public MeshNode(boolean adminMode, MeshEventListener listener) throws Exception {
-        this.isAdmin = adminMode;
-        this.role = adminMode ? "ADMIN" : "USER";
+        this.isAdmin  = adminMode;
+        this.role     = adminMode ? "ADMIN" : "USER";
         this.listener = listener;
-        this.nodeId = loadOrGenerateId();
+        this.nodeId   = loadOrGenerateId();
 
         socket = new DatagramSocket(PORT);
         socket.setBroadcast(true);
@@ -46,15 +47,26 @@ public class MeshNode {
     // ─────────────────────────────────────────
     // Public Accessors
     // ─────────────────────────────────────────
-    public String getNodeId()     { return nodeId; }
-    public String getRole()       { return role; }
+    public String  getNodeId()    { return nodeId; }
+    public String  getRole()      { return role; }
     public boolean isAdmin()      { return isAdmin; }
-    public int getBatteryLevel()  { return batteryLevel; }
+    public int     getBatteryLevel() { return batteryLevel; }
+
+    /** Returns a snapshot of known node IDs (for priority dialog population) */
+    public Set<String> getKnownNodeIds() {
+        return Collections.unmodifiableSet(knownNodes.keySet());
+    }
 
     public void setBatteryLevel(int level) {
         this.batteryLevel = Math.max(0, Math.min(100, level));
         listener.onBatteryUpdate(this.batteryLevel);
         listener.onSystemMessage("Battery set to " + this.batteryLevel + "%");
+    }
+
+    /** Admin sets a display-priority label for a node (e.g. "HIGH", "CRITICAL") */
+    public void setNodePriority(String nodeId, String priority) {
+        nodePriorities.put(nodeId, priority);
+        fireDashboardUpdate();
     }
 
     // ─────────────────────────────────────────
@@ -85,9 +97,8 @@ public class MeshNode {
     // ─────────────────────────────────────────
     private void startDiscoveryHeartbeat() {
         scheduler.scheduleAtFixedRate(() -> {
-            try {
-                if (isNeighborInRange) sendBroadcastHello();
-            } catch (Exception ignored) {}
+            try { if (isNeighborInRange) sendBroadcastHello(); }
+            catch (Exception ignored) {}
         }, 0, 5, TimeUnit.SECONDS);
     }
 
@@ -107,9 +118,9 @@ public class MeshNode {
                     if (timedOutId != null) {
                         disconnectedNodes.add(timedOutId);
                         listener.onPeerLost(timedOutId);
-                        if (isAdmin) {
+                        if (isAdmin)
                             listener.onSystemMessage("[ADMIN ALERT] Node Disconnected: " + timedOutId);
-                        }
+                        fireDashboardUpdate();
                     }
                 }
                 return timedOut;
@@ -130,23 +141,21 @@ public class MeshNode {
 
                     InetAddress myAddr = InetAddress.getLocalHost();
                     if (packet.getAddress().getHostAddress().equals(myAddr.getHostAddress())
-                            && packet.getPort() == PORT) {
-                        continue;
-                    }
+                            && packet.getPort() == PORT) continue;
 
                     InetSocketAddress sender = new InetSocketAddress(packet.getAddress(), packet.getPort());
-                    ObjectInputStream ois = new ObjectInputStream(new ByteArrayInputStream(packet.getData()));
+                    ObjectInputStream ois = new ObjectInputStream(
+                            new ByteArrayInputStream(packet.getData()));
 
-                    PacketType type = (PacketType) ois.readObject();
-                    String senderId = (String) ois.readObject();
+                    PacketType type    = (PacketType) ois.readObject();
+                    String     senderId = (String) ois.readObject();
 
-                    // Re-appearance detection
                     boolean wasOffline = disconnectedNodes.remove(senderId);
-                    boolean isNew = !knownNodes.containsKey(senderId);
+                    boolean isNew      = !knownNodes.containsKey(senderId);
 
                     if (wasOffline) {
                         listener.onPeerReturned(senderId);
-                        if (!peerIsInList(senderId)) listener.onPeerDiscovered(senderId);
+                        if (!knownNodes.containsKey(senderId)) listener.onPeerDiscovered(senderId);
                     } else if (isNew) {
                         listener.onPeerDiscovered(senderId);
                     }
@@ -156,19 +165,17 @@ public class MeshNode {
 
                     if (type == PacketType.DATA) {
                         Message msg = (Message) ois.readObject();
-                        sendObject(PacketType.ACK, null, sender); // Send delivery receipt
+                        sendObject(PacketType.ACK, null, sender);
                         handleIncomingMessage(msg);
                     } else if (type == PacketType.ACK) {
                         listener.onDeliveryAck(senderId);
                     }
 
+                    fireDashboardUpdate();
+
                 } catch (Exception ignored) {}
             }
         }).start();
-    }
-
-    private boolean peerIsInList(String id) {
-        return knownNodes.containsKey(id) && !disconnectedNodes.contains(id);
     }
 
     // ─────────────────────────────────────────
@@ -179,21 +186,20 @@ public class MeshNode {
         localStore.put(msg.id, msg);
 
         boolean forMe = msg.scope == Message.Scope.BROADCAST ||
-                (msg.scope == Message.Scope.TARGETED && (msg.targets.contains(nodeId) || isAdmin));
+                (msg.scope == Message.Scope.TARGETED &&
+                 (msg.targets.contains(nodeId) || isAdmin));
 
         if (forMe) {
-            // Admin SOS alert with IST timestamp
             if (isAdmin && msg.urgent) {
                 DateTimeFormatter dtf = DateTimeFormatter.ofPattern("EEE, d MMM yyyy HH:mm:ss Z")
                         .withZone(ZoneId.of("Asia/Kolkata"));
-                String formattedTime = dtf.format(Instant.ofEpochMilli(msg.timestamp));
-                listener.onSystemMessage("[" + formattedTime + "] [ADMIN ALERT - SOS] From "
-                        + msg.senderId + ": " + msg.content);
+                String ts = dtf.format(Instant.ofEpochMilli(msg.timestamp));
+                listener.onSystemMessage("[" + ts + "] [SOS ALERT] From " + msg.senderId + ": " + msg.content);
             }
             listener.onMessageReceived(msg);
         }
 
-        // Relay / flood with TTL
+        // Relay with TTL
         if (msg.ttl > 0 && msg.scope != Message.Scope.LOCAL) {
             msg.ttl--;
             for (InetSocketAddress n : neighbors.keySet()) {
@@ -205,30 +211,36 @@ public class MeshNode {
     // ─────────────────────────────────────────
     // Public Send API
     // ─────────────────────────────────────────
-
-    /** Broadcast to all peers. Returns a status string if message was buffered or blocked. */
-    public String broadcastMessage(String content) {
-        Message msg = new Message(content, nodeId, role, Message.Scope.BROADCAST, null);
+    public String broadcastMessage(String content, Message.Priority priority) {
+        Message msg = new Message(content, nodeId, role, Message.Scope.BROADCAST, null, priority);
         return sendOrBuffer(msg);
     }
 
-    /** Targeted send (admin only). Returns a status string. */
-    public String sendTargeted(String content, Set<String> targets) {
+    public String broadcastMessage(String content) {
+        return broadcastMessage(content, Message.Priority.NORMAL);
+    }
+
+    public String sendTargeted(String content, Set<String> targets, Message.Priority priority) {
         if (!isAdmin) return "[DENIED] Targeted send requires Admin role.";
-        Message msg = new Message(content, nodeId, role, Message.Scope.TARGETED, targets);
+        Message msg = new Message(content, nodeId, role, Message.Scope.TARGETED, targets, priority);
         return sendOrBuffer(msg);
+    }
+
+    public String sendTargeted(String content, Set<String> targets) {
+        return sendTargeted(content, targets, Message.Priority.NORMAL);
     }
 
     private String sendOrBuffer(Message msg) {
-        if (batteryLevel < 15 && !msg.urgent) {
-            return "[BLOCKED] Battery too low (" + batteryLevel + "%). Urgent messages only.";
+        // CRITICAL always bypasses low-battery block
+        if (batteryLevel < 15 && msg.priority != Message.Priority.CRITICAL) {
+            return "[BLOCKED] Battery too low (" + batteryLevel + "%). Only CRITICAL messages allowed.";
         }
         localStore.put(msg.id, msg);
 
         if (!isNeighborInRange || neighbors.isEmpty()) {
             buffer.add(msg);
             listener.onBufferUpdate(buffer.size());
-            return "[BUFFERED] No active neighbors. Message queued (" + buffer.size() + " queued).";
+            return "[BUFFERED] No active neighbors. Message queued (" + buffer.size() + " in queue).";
         }
 
         for (InetSocketAddress n : neighbors.keySet()) {
@@ -236,7 +248,7 @@ public class MeshNode {
         }
         batteryLevel = Math.max(0, batteryLevel - 1);
         listener.onBatteryUpdate(batteryLevel);
-        return null; // success, no status message needed
+        return null;
     }
 
     // ─────────────────────────────────────────
@@ -252,6 +264,8 @@ public class MeshNode {
         if (buffer.isEmpty()) return;
         listener.onSystemMessage("Flushing " + buffer.size() + " buffered message(s)...");
         synchronized (buffer) {
+            // Sort: CRITICAL first, then HIGH, NORMAL, LOW
+            buffer.sort((a, b) -> b.priority.ordinal() - a.priority.ordinal());
             for (Message msg : buffer) {
                 for (InetSocketAddress n : neighbors.keySet()) {
                     try { sendObject(PacketType.DATA, msg, n); } catch (Exception ignored) {}
@@ -262,26 +276,38 @@ public class MeshNode {
         }
         listener.onBufferUpdate(0);
         listener.onBatteryUpdate(batteryLevel);
-        listener.onSystemMessage("Buffer flushed. All messages sent.");
+        listener.onSystemMessage("Buffer flushed. All messages delivered.");
     }
 
     // ─────────────────────────────────────────
-    // Status Report (for /status panel)
+    // Dashboard Data
     // ─────────────────────────────────────────
+    private void fireDashboardUpdate() {
+        if (!isAdmin) return;
+        Map<String, String> statuses   = new LinkedHashMap<>();
+        Map<String, String> priorities = new LinkedHashMap<>();
+        Map<String, String> addresses  = new LinkedHashMap<>();
+        knownNodes.forEach((id, addr) -> {
+            statuses.put(id, neighbors.containsKey(addr) ? "ONLINE" : "OFFLINE");
+            priorities.put(id, nodePriorities.getOrDefault(id, "NORMAL"));
+            addresses.put(id, addr.getAddress().getHostAddress());
+        });
+        listener.onDashboardUpdate(statuses, priorities, addresses);
+    }
+
     public String getStatusReport() {
         if (!isAdmin) return "[DENIED] Admin only.";
         if (knownNodes.isEmpty()) return "[STATUS] No known nodes yet.";
-
         StringBuilder sb = new StringBuilder();
-        sb.append("─── NODE REGISTRY ───────────────────────\n");
-        sb.append(String.format("  %-10s  %-17s  %s\n", "NODE ID", "ADDRESS", "STATUS"));
-        sb.append("  " + "─".repeat(44) + "\n");
+        sb.append("NODE REGISTRY\n");
+        sb.append(String.format("%-10s  %-16s  %-8s  %s\n", "ID", "ADDRESS", "STATUS", "PRIORITY"));
+        sb.append("─".repeat(52) + "\n");
         knownNodes.forEach((id, addr) -> {
-            String status = neighbors.containsKey(addr) ? "● ONLINE" : "○ OFFLINE";
-            sb.append(String.format("  %-10s  %-17s  %s\n", id,
-                    addr.getAddress().getHostAddress(), status));
+            String status   = neighbors.containsKey(addr) ? "ONLINE" : "OFFLINE";
+            String priority = nodePriorities.getOrDefault(id, "NORMAL");
+            sb.append(String.format("%-10s  %-16s  %-8s  %s\n",
+                    id, addr.getAddress().getHostAddress(), status, priority));
         });
-        sb.append("─────────────────────────────────────────");
         return sb.toString();
     }
 
@@ -292,14 +318,14 @@ public class MeshNode {
         sendObject(PacketType.HELLO, null, new InetSocketAddress("255.255.255.255", PORT));
         try {
             String localIp = InetAddress.getLocalHost().getHostAddress();
-            String subnet = localIp.substring(0, localIp.lastIndexOf("."));
+            String subnet  = localIp.substring(0, localIp.lastIndexOf("."));
             sendObject(PacketType.HELLO, null, new InetSocketAddress(subnet + ".255", PORT));
         } catch (Exception ignored) {}
     }
 
     private void sendObject(PacketType type, Object payload, InetSocketAddress target) throws Exception {
         ByteArrayOutputStream bos = new ByteArrayOutputStream();
-        ObjectOutputStream oos = new ObjectOutputStream(bos);
+        ObjectOutputStream    oos = new ObjectOutputStream(bos);
         oos.writeObject(type);
         oos.writeObject(nodeId);
         if (payload != null) oos.writeObject(payload);
