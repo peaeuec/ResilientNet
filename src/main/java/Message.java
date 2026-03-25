@@ -1,10 +1,9 @@
-import java.io.Serializable;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
 
-public class Message implements Serializable {
+public class Message {
 
     public enum Scope {
         LOCAL,      // Only for the immediate neighbor
@@ -16,7 +15,7 @@ public class Message implements Serializable {
         LOW,      // Routine info
         NORMAL,   // Standard message
         HIGH,     // Important, needs attention
-        CRITICAL  // Urgent / SOS — always delivered even on low battery
+        CRITICAL  
     }
 
     public String   id;
@@ -29,6 +28,11 @@ public class Message implements Serializable {
     public Set<String> targets;
     public int      ttl = 3;
     public Priority priority;
+
+    // --- NEW: Empty Constructor Required for GSON ---
+    public Message() {
+        this.targets = new HashSet<>();
+    }
 
     public Message(String content, String senderId, String senderRole,
                    Scope scope, Set<String> targets, Priority priority) {
